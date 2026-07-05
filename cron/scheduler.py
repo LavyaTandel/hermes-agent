@@ -2250,9 +2250,13 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
-def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+def run_job(job: dict, *, adapters=None, loop=None) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
+
+    When ``adapters`` and ``loop`` are provided, delivery is performed
+    inside this function BEFORE agent cleanup — so the async executor
+    is still alive when ``_deliver_result()`` fires. (#58720)
     
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -3000,6 +3004,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 """
         
         logger.info("Job '%s' completed successfully", job_name)
+        # Deliver BEFORE the finally block tears down the agent's async
+        # executor — fixes #58720 (RuntimeError: cannot schedule new futures
+        # after interpreter shutdown).
+        if adapters is not None and loop is not None:
+            _deliver_content = final_response or ""
+            if _deliver_content.strip() and not _is_cron_silence_response(_deliver_content):
+                try:
+                    _deliver_result(job, _deliver_content, adapters=adapters, loop=loop)
+                except Exception as _de:
+                    logger.error("Job '%s': delivery error: %s", job_id, _de)
         return True, output, final_response, None
         
     except Exception as e:
@@ -3022,6 +3036,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 {error_msg}
 ```
 """
+        # Deliver failed-job output BEFORE agent teardown (#58720).
+        if adapters is not None and loop is not None:
+            _err_content = _summarize_cron_failure_for_delivery(job, error_msg)
+            if _err_content and _err_content.strip():
+                try:
+                    _deliver_result(job, _err_content, adapters=adapters, loop=loop)
+                except Exception as _de:
+                    logger.error("Job '%s': delivery error: %s", job_id, _de)
         return False, output, "", error_msg
 
     finally:
@@ -3114,37 +3136,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             )
             return True  # not an error — already handled/removed
 
-        success, output, final_response, error = run_job(job)
+        success, output, final_response, error = run_job(
+            job, adapters=adapters, loop=loop
+        )
 
         output_file = save_job_output(job["id"], output)
         if verbose:
             logger.info("Output saved to: %s", output_file)
 
-        # Deliver the final response to the origin/target chat.
-        # If the agent responded with [SILENT], skip delivery (but
-        # output is already saved above).  Failed jobs always deliver.
-        deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
-        # Treat whitespace-only final responses the same as empty
-        # responses: do not deliver a blank message, and let the
-        # empty-response guard below mark the run as a soft failure.
-        should_deliver = bool(deliver_content.strip())
-        # Cron silence suppression — see _is_cron_silence_response.  Replaces the
-        # old `SILENT_MARKER in ...upper()` substring check, which both leaked
-        # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
-        # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
-        # #46917).  Keeps the intentional bracketed-prefix / trailing-line
-        # tolerance the cron contract relies on.
-        if should_deliver and success and _is_cron_silence_response(deliver_content):
-            logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-            should_deliver = False
-
-        delivery_error = None
-        if should_deliver:
-            try:
-                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-            except Exception as de:
-                delivery_error = str(de)
-                logger.error("Delivery failed for job %s: %s", job["id"], de)
+        # Delivery is now performed inside run_job() BEFORE agent teardown
+        # so the async executor is still alive when _deliver_result() fires.
+        # See #58720.
 
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
@@ -3153,7 +3155,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        mark_job_run(job["id"], success, error, delivery_error=None)
         return True
 
     except Exception as e:
