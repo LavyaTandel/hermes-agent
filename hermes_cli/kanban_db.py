@@ -6407,9 +6407,39 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Retrying won't
-                # help.
+                # ``running`` in the DB. Normally that's a protocol
+                # violation (no kanban_complete/kanban_block call) and
+                # retrying won't help. BUT if task_runs already holds a
+                # *completed* run, the work genuinely finished in an
+                # earlier run — recover to done instead of tripping the
+                # breaker and permanently blocking an already-done card
+                # (which would need manual DB intervention). See #60802.
+                done_run = conn.execute(
+                    "SELECT ended_at FROM task_runs "
+                    "WHERE task_id = ? AND outcome = 'completed' "
+                    "ORDER BY COALESCE(ended_at, 0) DESC LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                if done_run is not None:
+                    completed_at = (
+                        int(done_run["ended_at"])
+                        if done_run["ended_at"]
+                        else int(time.time())
+                    )
+                    _end_run(conn, row["id"], outcome="completed", status="done")
+                    conn.execute(
+                        "UPDATE tasks SET status='done', completed_at=?, "
+                        "claim_lock=NULL, claim_expires=NULL, "
+                        "worker_pid=NULL, current_run_id=NULL, "
+                        "block_kind=NULL, block_recurrences=0 "
+                        "WHERE id = ? AND status='running' AND worker_pid = ?",
+                        (completed_at, row["id"], pid),
+                    )
+                    _append_event(
+                        conn, row["id"], "protocol_violation_recovered",
+                        {"pid": pid, "claimer": row["claim_lock"], "exit_code": code},
+                    )
+                    continue
                 protocol_violation = True
                 error_text = (
                     "worker exited cleanly (rc=0) without calling "

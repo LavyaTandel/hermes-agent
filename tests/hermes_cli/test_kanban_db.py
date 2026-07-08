@@ -850,6 +850,82 @@ def test_detect_crashed_workers_grace_period_env_override(
         assert tid in kb.detect_crashed_workers(conn)
 
 
+def test_detect_crashed_workers_recovers_completed_run(kanban_home, monkeypatch):
+    """A clean-exit (rc=0) worker whose task is still ``running`` is normally
+    a protocol violation that trips the breaker. BUT if task_runs already holds
+    a *completed* run, the work genuinely finished earlier — recover the card
+    to ``done`` instead of permanently blocking it. Regression for #60802."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.delenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", raising=False)
+    # Classify our fake dead PID as a clean exit (rc=0).
+    _kb._record_worker_exit(90001, _exited_status(0))
+
+    now = 3_000_000.0
+    monkeypatch.setattr(_kb.time, "time", lambda: now + 60)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="already done", assignee="a")
+        # Simulate a prior completed run recorded in task_runs.
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (tid, int(now) - 100, int(now) - 50),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=?, "
+            "started_at=? WHERE id=?",
+            (90001, f"{host}:w", int(now), tid),
+        )
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        # Not a crash — the work was already completed.
+        assert tid not in crashed
+        task = kb.get_task(conn, tid)
+        assert task.status == "done", (
+            f"card with a completed run should recover to done, got {task.status}"
+        )
+        assert task.completed_at is not None
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "protocol_violation_recovered" for e in events)
+
+
+def test_detect_crashed_workers_protocol_violation_without_prior_run(
+    kanban_home, monkeypatch,
+):
+    """Clean exit with NO prior completed run still trips the breaker as a
+    protocol violation (the auto-block path must be preserved)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.delenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", raising=False)
+    _kb._record_worker_exit(90002, _exited_status(0))
+
+    now = 4_000_000.0
+    monkeypatch.setattr(_kb.time, "time", lambda: now + 60)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="never completed", assignee="a")
+        # No completed run in task_runs.
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=?, "
+            "started_at=? WHERE id=?",
+            (90002, f"{host}:w", int(now), tid),
+        )
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed, "clean exit without a completed run must crash"
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"protocol violation with no prior run should auto-block, got {task.status}"
+        )
+
+
 def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
     """Bad env values fall back to DEFAULT_CRASH_GRACE_SECONDS."""
     import hermes_cli.kanban_db as _kb
