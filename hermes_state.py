@@ -23,7 +23,6 @@ import sqlite3
 import sys
 import threading
 import time
-import platform
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -343,6 +342,7 @@ def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
     db_label: str = "state.db",
+    preferred_mode: Optional[str] = None,
 ) -> str:
     """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
 
@@ -362,34 +362,59 @@ def apply_wal_with_fallback(
     Shared by :class:`SessionDB` and ``hermes_cli.kanban_db.connect`` so
     both databases get identical fallback behavior.
 
+    ``preferred_mode``: when a user explicitly configures ``database.
+    journal_mode`` (e.g. ``delete`` to dodge a WAL/DELETE mode switch while
+    the gateway holds the file), honor it HERE — inside the safety-aware
+    path — rather than overriding the mode after this returns.  The same
+    guards apply: we never downgrade a database another process has already
+    put in WAL on disk, and an incompatible-FS / locked failure is surfaced
+    instead of silently swallowed.  An unknown/unsupported value is ignored
+    and WAL remains the default.
+
     Never downgrades to DELETE if the on-disk DB header reports WAL — see _on_disk_journal_mode.
     """
+    preferred = (preferred_mode or "").strip().lower()
+    if preferred not in ("", "wal", "delete"):
+        preferred = ""  # unsupported -> ignore, keep WAL default
+
     # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
     # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
     try:
         current_mode = conn.execute("PRAGMA journal_mode").fetchone()
         if current_mode and current_mode[0] == "wal":
+            # On-disk already in WAL. Honor an explicit user DELETE request
+            # (they own this connection, set before any write); otherwise keep
+            # WAL — never silently flip a mode a prior run established.
+            if preferred == "delete":
+                conn.execute("PRAGMA journal_mode=DELETE")
+                return "delete"
             _apply_macos_checkpoint_barrier(conn)
             return "wal"
     except sqlite3.OperationalError:
         pass
 
+    # Choose the mode to attempt: explicit user pref, else WAL default.
+    target = preferred if preferred in ("wal", "delete") else "wal"
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA journal_mode={target.upper()}")
         _apply_macos_checkpoint_barrier(conn)
-        return "wal"
+        return target
     except sqlite3.OperationalError as exc:
         msg = str(exc).lower()
-        if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
-            # Unrelated OperationalError — don't silently swallow.
-            raise
-        # Don't downgrade if another process already set WAL on disk.
-        existing = _on_disk_journal_mode(conn)
-        if existing == "wal":
-            raise
-        _log_wal_fallback_once(db_label, exc)
-        conn.execute("PRAGMA journal_mode=DELETE")
-        return "delete"
+        # WAL-incompatible FS: fall back to DELETE if the user didn't force it.
+        if any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
+            if target == "delete":
+                # User explicitly wanted DELETE and even that failed (locked?) —
+                # surface it; do not pretend success.
+                raise
+            existing = _on_disk_journal_mode(conn)
+            if existing == "wal":
+                raise
+            _log_wal_fallback_once(db_label, exc)
+            conn.execute("PRAGMA journal_mode=DELETE")
+            return "delete"
+        # Unrelated OperationalError — don't silently swallow.
+        raise
 
 
 def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
@@ -415,14 +440,20 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Config-driven database pragmas
+# Config-driven database pragmas (non-journal-mode)
 # ---------------------------------------------------------------------------
 def apply_database_pragmas(
     conn: sqlite3.Connection,
     *,
     db_label: str = "state.db",
 ) -> None:
-    """Apply optional database PRAGMAs from ``config.yaml``."""
+    """Apply optional database PRAGMAs from ``config.yaml`` (except journal_mode,
+    which is handled inside ``apply_wal_with_fallback`` so it stays safety-aware).
+
+    ponytail (#57918): journal_mode is intentionally NOT overridden here — doing
+    so after ``apply_wal_with_fallback`` bypassed the WAL/DELETE safety contract
+    (mixed-mode corruption, silent discard on lock failure, broken Windows path).
+    """
     try:
         # ponytail: local import avoids circular with hermes_cli.config
         from hermes_cli.config import cfg_get, load_config
@@ -430,24 +461,6 @@ def apply_database_pragmas(
         cfg = load_config()
     except Exception:
         return
-
-    journal_mode = cfg_get(cfg, "database", "journal_mode", default="")
-    if journal_mode:
-        journal_mode = str(journal_mode).strip().upper()
-        if journal_mode:
-            try:
-                current = conn.execute("PRAGMA journal_mode").fetchone()
-                current = current[0].upper() if current and current[0] else ""
-            except sqlite3.OperationalError:
-                current = ""
-
-            if current != journal_mode:
-                if platform.system() == "Windows" and journal_mode != "WAL":
-                    return
-                try:
-                    conn.execute(f"PRAGMA journal_mode={journal_mode}")
-                except sqlite3.OperationalError:
-                    pass
 
     wal_autocheckpoint = cfg_get(cfg, "database", "wal_autocheckpoint", default="")
     if wal_autocheckpoint is not None and str(wal_autocheckpoint).strip().isdigit():
@@ -986,7 +999,21 @@ class SessionDB:
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
-                apply_wal_with_fallback(self._conn, db_label="state.db")
+                # #57918: read the configured journal_mode once and pass it as
+                # the safety-aware preferred_mode so it's honored INSIDE
+                # apply_wal_with_fallback (never as a post-hoc override).
+                _preferred = ""
+                try:
+                    from hermes_cli.config import cfg_get, load_config
+
+                    _cfg = load_config()
+                    _preferred = cfg_get(_cfg, "database", "journal_mode", default="") or ""
+                except Exception:
+                    _preferred = ""
+                apply_wal_with_fallback(
+                    self._conn, db_label="state.db",
+                    preferred_mode=str(_preferred).strip() or None,
+                )
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._init_schema()

@@ -4963,3 +4963,58 @@ class TestApplyDatabasePragmas:
         finally:
             conn.close()
 
+
+class TestApplyWalWithPreferredMode:
+    """#57918: config-driven journal_mode must be honored INSIDE the safety-aware
+    apply_wal_with_fallback path, not overridden after it (which bypassed the
+    WAL/DELETE corruption guard).
+    """
+
+    def test_preferred_delete_switches_from_wal(self, tmp_path):
+        import sqlite3
+        from hermes_state import apply_wal_with_fallback
+
+        db_path = tmp_path / "a.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            assert apply_wal_with_fallback(conn, preferred_mode="delete") == "delete"
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        finally:
+            conn.close()
+
+    def test_preferred_wal_keeps_wal(self, tmp_path):
+        import sqlite3
+        from hermes_state import apply_wal_with_fallback
+
+        db_path = tmp_path / "b.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert apply_wal_with_fallback(conn, preferred_mode="wal") == "wal"
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        finally:
+            conn.close()
+
+    def test_no_preferred_defaults_to_wal(self, tmp_path):
+        import sqlite3
+        from hermes_state import apply_wal_with_fallback
+
+        db_path = tmp_path / "c.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert apply_wal_with_fallback(conn) == "wal"
+        finally:
+            conn.close()
+
+    def test_unsupported_preferred_ignored(self, tmp_path):
+        import sqlite3
+        from hermes_state import apply_wal_with_fallback
+
+        db_path = tmp_path / "d.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # "memory" is not a valid journal mode -> ignored, WAL default wins.
+            assert apply_wal_with_fallback(conn, preferred_mode="memory") == "wal"
+        finally:
+            conn.close()
+
