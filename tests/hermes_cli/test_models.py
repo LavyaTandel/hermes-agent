@@ -235,6 +235,15 @@ class TestFindOpenrouterSlug:
         with patch("hermes_cli.models.fetch_openrouter_models", return_value=LIVE_OPENROUTER_MODELS):
             assert _find_openrouter_slug("totally-fake-model-xyz") is None
 
+    def test_anthropic_dash_form_matches_dot_catalog(self):
+        from hermes_cli.models import _find_openrouter_slug
+        with patch("hermes_cli.models.fetch_openrouter_models", return_value=LIVE_OPENROUTER_MODELS):
+            # Anthropic native uses dashes (claude-opus-4-6), OpenRouter uses dots (claude-opus-4.6)
+            assert _find_openrouter_slug("claude-opus-4-6") == "anthropic/claude-opus-4.6"
+            assert _find_openrouter_slug("CLAUDE-OPUS-4-6") == "anthropic/claude-opus-4.6"
+            # Reverse: dot-form input also matches dash-form catalog (bidirectional)
+            assert _find_openrouter_slug("claude-opus-4.6") == "anthropic/claude-opus-4.6"
+
 
 class TestDetectProviderForModel:
     def test_anthropic_model_detected(self):

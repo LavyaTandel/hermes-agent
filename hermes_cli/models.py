@@ -2003,6 +2003,7 @@ def _find_openrouter_slug(model_name: str) -> Optional[str]:
     - Exact match: ``anthropic/claude-opus-4.6`` → as-is
     - Bare name: ``deepseek-chat`` → ``deepseek/deepseek-chat``
     - Bare name: ``claude-opus-4.6`` → ``anthropic/claude-opus-4.6``
+    - Anthropic-native dash form: ``claude-opus-4-6`` → ``anthropic/claude-opus-4.6``
     """
     name_lower = model_name.strip().lower()
     if not name_lower:
@@ -2014,10 +2015,24 @@ def _find_openrouter_slug(model_name: str) -> Optional[str]:
             return mid
 
     # Try matching just the model part (after the /)
+    # Also normalize dash↔dot since Anthropic native IDs use dashes
+    # while OpenRouter catalog uses dots (e.g. claude-opus-4-6 vs claude-opus-4.6)
+    # Only normalize the last dash/dot (version separator), not all dashes in model name
+    name_variants = {name_lower}
+    # If input ends with dash-version (e.g. claude-opus-4-6), try dot-version
+    if name_lower.count("-") >= 2:
+        last_dash = name_lower.rfind("-")
+        name_variants.add(name_lower[:last_dash] + "." + name_lower[last_dash+1:])
+    # If input has dot-version (e.g. claude-opus-4.6), try dash-version
+    if "." in name_lower and name_lower.rfind(".") > name_lower.rfind("-"):
+        last_dot = name_lower.rfind(".")
+        name_variants.add(name_lower[:last_dot] + "-" + name_lower[last_dot+1:])
+
     for mid in model_ids():
         if "/" in mid:
             _, model_part = mid.split("/", 1)
-            if name_lower == model_part.lower():
+            model_part_lower = model_part.lower()
+            if any(variant == model_part_lower for variant in name_variants):
                 return mid
 
     return None
