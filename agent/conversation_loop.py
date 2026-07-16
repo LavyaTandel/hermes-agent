@@ -4630,6 +4630,49 @@ def run_conversation(
             else:
                 # No tool calls - this is the final response
                 final_response = assistant_message.content or ""
+
+                # ── Contradictory finish_reason guard (#65430) ──────
+                # If the model signaled finish_reason=tool_calls but
+                # emitted NO tool_calls (provider dropped/stripped them,
+                # or a router rewrote finish_reason), do NOT deliver the
+                # accompanying narration as a final response — that
+                # silently ends an autonomous/cron turn mid-task. Re-request
+                # the tool calls instead. Capped so a stuck model can't
+                # loop forever; after the cap we fall through to the
+                # normal final-response path (better a partial answer than
+                # an infinite turn).
+                if (
+                    finish_reason == "tool_calls"
+                    and not getattr(assistant_message, "tool_calls", None)
+                    and not getattr(agent, "_tool_calls_expected_retried", False)
+                ):
+                    agent._tool_calls_expected_retried = True
+                    agent._mute_post_response = False
+                    logger.warning(
+                        "finish_reason=tool_calls but no tool_calls present — "
+                        "re-requesting tool calls (model=%s)",
+                        agent.model,
+                    )
+                    agent._buffer_status(
+                        "⚠️ Model signaled tool calls but emitted none — "
+                        "re-requesting"
+                    )
+                    _tc_nudge = agent._build_assistant_message(
+                        assistant_message, finish_reason
+                    )
+                    messages.append(_tc_nudge)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You ended your last message with finish_reason="
+                            "tool_calls but did not include any tool_calls. "
+                            "Please re-emit your response WITH the tool calls "
+                            "so the task can continue."
+                        ),
+                        "_empty_recovery_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    continue
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery

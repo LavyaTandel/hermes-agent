@@ -3984,6 +3984,33 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_finish_reason_tool_calls_without_tool_calls_rerequests(self, agent):
+        # Regression for #65430: a model that signals finish_reason=tool_calls
+        # but emits NO tool_calls (provider stripped them) must NOT deliver the
+        # accompanying narration text as the final response. The loop must
+        # re-request the tool calls rather than silently ending the turn.
+        self._setup_agent(agent)
+        narration = "Let me check the remaining data..."
+        resp1 = _mock_response(content=narration, finish_reason="tool_calls", tool_calls=None)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp2 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp3 = _mock_response(content="Done searching", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+        with (
+            patch("run_agent.handle_function_call", return_value="search result") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("audit the system")
+        # The narration from resp1 must NOT be the final answer.
+        assert result["final_response"] == "Done searching"
+        # Tool from resp2 must actually have been executed.
+        assert mock_handle_function_call.called
+        assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
+        # Three API calls: re-request + tool turn + final.
+        assert result["api_calls"] == 3
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
